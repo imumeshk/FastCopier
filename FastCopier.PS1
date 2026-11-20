@@ -1,8 +1,13 @@
 <#
 .SYNOPSIS
 Fast File Copier and Mover GUI Tool
+.VERSION
+1.1.0
+.DESCRIPTION
 Supports Multi-Drive Source Selections and Auto-Refresh Network/USB Drives
 #>
+
+$script:FastCopierVersion = '1.1.0'
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName System.Windows.Forms
@@ -54,6 +59,61 @@ public class FileItem : INotifyPropertyChanged
     }
 }
 
+public static class DirectoryLoader
+{
+    public static void LoadAsync(string path, bool showHidden, Dispatcher dispatcher, Action<List<FileItem>, string> callback)
+    {
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            List<FileItem> items = new List<FileItem>();
+            string error = null;
+            try
+            {
+                foreach (string entryPath in Directory.EnumerateFileSystemEntries(path))
+                {
+                    try
+                    {
+                        FileAttributes attributes = File.GetAttributes(entryPath);
+                        if (!showHidden && (attributes & FileAttributes.Hidden) == FileAttributes.Hidden) continue;
+                        bool isDirectory = (attributes & FileAttributes.Directory) == FileAttributes.Directory;
+                        FileInfo fi = isDirectory ? null : new FileInfo(entryPath);
+                        string ext = isDirectory ? "" : Path.GetExtension(entryPath);
+                        items.Add(new FileItem {
+                            Name = Path.GetFileName(entryPath), FullPath = entryPath,
+                            Type = isDirectory ? "Folder" : (String.IsNullOrWhiteSpace(ext) ? "File" : ext),
+                            Size = isDirectory ? 0 : fi.Length,
+                            SizeStr = isDirectory ? "" : FormatSize(fi.Length),
+                            CreationTime = (isDirectory ? Directory.GetCreationTime(entryPath) : fi.CreationTime).ToString("yyyy-MM-dd HH:mm"),
+                            Icon = isDirectory ? Char.ConvertFromUtf32(0xE8B7) : Char.ConvertFromUtf32(0xE7C3),
+                            IconColor = isDirectory ? "#F59E0B" : "#64748B",
+                            Status = "Ready"
+                        });
+                    }
+                    catch (Exception ex) { error = "Some entries could not be read: " + ex.Message; }
+                }
+                items.Sort((a, b) => {
+                    bool ad = a.Type == "Folder", bd = b.Type == "Folder";
+                    if (ad != bd) return ad ? -1 : 1;
+                    return String.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase);
+                });
+            }
+            catch (Exception ex) { error = ex.Message; }
+            if (dispatcher != null && callback != null) {
+                try { dispatcher.BeginInvoke(new Action(() => callback(items, error))); }
+                catch { /* The window may close while a directory listing is finishing. */ }
+            }
+        });
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        if (bytes >= 1024L * 1024L * 1024L) return String.Format("{0:N2} GB", (double)bytes / (1024L * 1024L * 1024L));
+        if (bytes >= 1024L * 1024L) return String.Format("{0:N2} MB", (double)bytes / (1024L * 1024L));
+        if (bytes >= 1024L) return String.Format("{0:N2} KB", (double)bytes / 1024L);
+        return bytes + " B";
+    }
+}
+
 public class FastFileMover
 {
     private const int BufferSize = 8 * 1024 * 1024;
@@ -61,11 +121,15 @@ public class FastFileMover
     public Dispatcher UIDispatcher { get; set; }
     public Action<long, long, string> UIProgressAction { get; set; }
     public Func<string, int> UIOverwritePrompt { get; set; }
+    public Func<long, bool> UIPreflightAction { get; set; }
 
     public int DefaultOverwriteAction = -1; 
     public long TotalBytes = 0;
     public long ProcessedBytes = 0;
     public bool IsCancelled = false;
+    public int SuccessCount = 0;
+    public int SkippedCount = 0;
+    public int FailedCount = 0;
 
     public ManualResetEvent PauseEvent = new ManualResetEvent(true);
 
@@ -116,136 +180,116 @@ public class FastFileMover
         return 0;
     }
 
-    public void CopyFileFast(string source, string dest)
+    private bool IsOccupied(string path) { return File.Exists(path) || Directory.Exists(path); }
+
+    private string ResolveConflict(string source, ref string dest)
     {
-        if (IsCancelled) return;
-        bool fileExists = File.Exists(dest);
-        if (fileExists)
-        {
-            if (DefaultOverwriteAction == 3) { IsCancelled = true; return; }
-            if (DefaultOverwriteAction == 0) return; 
-            
-            int action = DefaultOverwriteAction;
-            if (action == -1)
-            {
-                action = PromptOverwrite(dest);
-            }
-            if (action == 3) { IsCancelled = true; return; }
-            if (action == 2) { DefaultOverwriteAction = 2; action = 1; }
-            if (action == 4) { DefaultOverwriteAction = 0; return; } 
-            if (action == 6) { DefaultOverwriteAction = 6; action = 5; } 
-            if (action == 0 || action == -1) { return; } 
-            
-            if (action == 5) {
-                string dir = Path.GetDirectoryName(dest);
-                string name = Path.GetFileNameWithoutExtension(dest);
-                string ext = Path.GetExtension(dest);
-                int counter = 1;
-                while (File.Exists(dest)) {
-                    dest = Path.Combine(dir ?? "", string.Format("{0} ({1}){2}", name, counter, ext));
-                    counter++;
-                }
-            }
+        if (!IsOccupied(dest)) return "write";
+        int action = DefaultOverwriteAction == -1 ? PromptOverwrite(dest) : DefaultOverwriteAction;
+        if (action == 3) { IsCancelled = true; Log("[CANCELLED] " + source); return "cancel"; }
+        if (action == 0 || action == 4) {
+            if (action == 4) DefaultOverwriteAction = 0;
+            SkippedCount++; Log("[SKIPPED] " + source); return "skip";
         }
+        if (action == 2) { DefaultOverwriteAction = 2; action = 1; }
+        if (action == 6) { DefaultOverwriteAction = 6; action = 5; }
+        if (action == 5) {
+            string dir = Path.GetDirectoryName(dest), name = Path.GetFileNameWithoutExtension(dest), ext = Path.GetExtension(dest);
+            int counter = 1;
+            do { dest = Path.Combine(dir ?? "", string.Format("{0} ({1}){2}", name, counter++, ext)); } while (IsOccupied(dest));
+            return "write";
+        }
+        if (action == 1) return "replace";
+        SkippedCount++; Log("[SKIPPED] " + source); return "skip";
+    }
 
+    public bool CopyFileFast(string source, string dest)
+    {
+        if (IsCancelled) return false;
+        string conflict = ResolveConflict(source, ref dest);
+        if (conflict != "write" && conflict != "replace") return false;
+        string temp = null;
         try {
+            FileInfo sourceInfo = new FileInfo(source);
+            DateTime creationTimeUtc = sourceInfo.CreationTimeUtc;
+            DateTime lastWriteTimeUtc = sourceInfo.LastWriteTimeUtc;
+            DateTime lastAccessTimeUtc = sourceInfo.LastAccessTimeUtc;
+            FileAttributes sourceAttributes = File.GetAttributes(source) & ~FileAttributes.ReparsePoint;
             string destDirectory = Path.GetDirectoryName(dest);
-            if (!string.IsNullOrEmpty(destDirectory) && !Directory.Exists(destDirectory))
-            {
-                Directory.CreateDirectory(destDirectory);
-            }
-
+            if (!string.IsNullOrEmpty(destDirectory) && !Directory.Exists(destDirectory)) Directory.CreateDirectory(destDirectory);
+            temp = Path.Combine(destDirectory ?? ".", ".fastcopier-" + Guid.NewGuid().ToString("N") + ".tmp");
             using (var sourceStream = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.SequentialScan))
-            using (var destStream = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, FileOptions.SequentialScan))
+            using (var destStream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, BufferSize, FileOptions.SequentialScan))
             {
                 byte[] buffer = new byte[BufferSize];
                 int bytesRead;
                 while ((bytesRead = sourceStream.Read(buffer, 0, buffer.Length)) > 0)
                 {
                     PauseEvent.WaitOne();
-                    if (IsCancelled) break;
+                    if (IsCancelled) return false;
                     destStream.Write(buffer, 0, bytesRead);
                     Interlocked.Add(ref ProcessedBytes, bytesRead);
                     ReportProgress(source);
                 }
             }
+            if (IsCancelled) return false;
+            try {
+                File.SetCreationTimeUtc(temp, creationTimeUtc);
+                File.SetLastWriteTimeUtc(temp, lastWriteTimeUtc);
+                File.SetLastAccessTimeUtc(temp, lastAccessTimeUtc);
+                File.SetAttributes(temp, sourceAttributes);
+            } catch (Exception ex) { Log("[METADATA WARNING] " + source + " : " + ex.Message); }
+            if (conflict == "replace") {
+                if (Directory.Exists(dest)) throw new IOException("A directory occupies the destination path.");
+                if (File.Exists(dest)) File.Replace(temp, dest, null); else File.Move(temp, dest);
+            } else File.Move(temp, dest);
+            temp = null;
             ForceReportProgress(source);
             Log(string.Format("[COPIED] {0} -> {1}", source, dest));
+            SuccessCount++;
+            return true;
         }
-        catch (Exception ex) { Log(string.Format("[ERROR] {0} : {1}", source, ex.Message)); }
+        catch (Exception ex) { FailedCount++; Log(string.Format("[ERROR] {0} : {1}", source, ex.Message)); return false; }
+        finally { if (temp != null) try { if (File.Exists(temp)) File.Delete(temp); } catch {} }
     }
     
     public void MoveFileFast(string source, string dest)
     {
+        PauseEvent.WaitOne();
         if (IsCancelled) return;
-        bool fileExists = File.Exists(dest);
-        if (fileExists)
-        {
-            if (DefaultOverwriteAction == 3) { IsCancelled = true; Log("[CANCELLED] " + source); return; }
-            if (DefaultOverwriteAction == 0) { Log("[SKIPPED] " + source); return; } 
-            
-            int action = DefaultOverwriteAction;
-            if (action == -1)
-            {
-                action = PromptOverwrite(dest);
-            }
-            if (action == 3) { IsCancelled = true; Log("[CANCELLED] " + source); return; }
-            if (action == 2) { DefaultOverwriteAction = 2; action = 1; }
-            if (action == 4) { DefaultOverwriteAction = 0; Log("[SKIPPED] " + source); return; } 
-            if (action == 6) { DefaultOverwriteAction = 6; action = 5; } 
-            if (action == 0 || action == -1) { Log("[SKIPPED] " + source); return; } 
-            
-            if (action == 5) {
-                string dir = Path.GetDirectoryName(dest);
-                string name = Path.GetFileNameWithoutExtension(dest);
-                string ext = Path.GetExtension(dest);
-                int counter = 1;
-                while (File.Exists(dest)) {
-                    dest = Path.Combine(dir ?? "", string.Format("{0} ({1}){2}", name, counter, ext));
-                    counter++;
-                }
-            } else {
-                try { File.Delete(dest); } catch (Exception ex) { Log(string.Format("[ERROR DELETING DEST] {0} : {1}", dest, ex.Message)); }
-            }
-        }
-        
+        string conflict = ResolveConflict(source, ref dest);
+        if (conflict != "write" && conflict != "replace") return;
         try {
             long length = new FileInfo(source).Length;
-            bool moved = false;
-            try {
-                // Try to move directly (works if same drive)
+            if (conflict == "write") {
+              try {
                 File.Move(source, dest);
-                moved = true;
-                Interlocked.Add(ref ProcessedBytes, length);
-                ForceReportProgress(source);
-                Log(string.Format("[MOVED] {0} -> {1}", source, dest));
-            } catch (IOException) { }
-            
-            if (!moved)
-            {
-                // Fallback to Copy then Delete
-                CopyFileFast(source, dest);
-                if (!IsCancelled)
-                {
-                    try { File.Delete(source); } catch (Exception ex) { Log(string.Format("[ERROR DELETING SOURCE] {0} : {1}", source, ex.Message)); }
-                }
+                Interlocked.Add(ref ProcessedBytes, length); SuccessCount++;
+                ForceReportProgress(source); Log(string.Format("[MOVED] {0} -> {1}", source, dest)); return;
+              } catch (IOException) { /* Cross-volume move; fall through to verified copy. */ }
             }
-        } catch (Exception ex) { Log(string.Format("[ERROR] {0} : {1}", source, ex.Message)); }
+            int previousOverwriteAction = DefaultOverwriteAction;
+            if (conflict == "replace") DefaultOverwriteAction = 1;
+            bool copied = CopyFileFast(source, dest);
+            DefaultOverwriteAction = previousOverwriteAction;
+            if (copied) {
+                try { File.Delete(source); Log(string.Format("[MOVED] {0} -> {1}", source, dest)); }
+                catch (Exception ex) { FailedCount++; Log(string.Format("[ERROR DELETING SOURCE] {0} : {1}", source, ex.Message)); }
+            }
+        } catch (Exception ex) { FailedCount++; Log(string.Format("[ERROR] {0} : {1}", source, ex.Message)); }
     }
     
     public long GetTotalSize(string[] paths)
     {
         long size = 0;
+        if (paths == null) return 0;
         foreach (var path in paths)
         {
-            if (File.Exists(path))
-            {
-                size += new FileInfo(path).Length;
-            }
-            else if (Directory.Exists(path))
-            {
-                size += GetDirectorySize(path);
-            }
+            try {
+                if (File.Exists(path)) size += new FileInfo(path).Length;
+                else if (Directory.Exists(path)) size += GetDirectorySize(path);
+                else Log("[SIZE WARNING] Source does not exist: " + path);
+            } catch (Exception ex) { Log("[SIZE WARNING] " + path + " : " + ex.Message); }
         }
         return size;
     }
@@ -254,12 +298,29 @@ public class FastFileMover
     {
         long size = 0;
         try {
-            DirectoryInfo di = new DirectoryInfo(folderPath);
-            foreach (FileInfo fi in di.EnumerateFiles("*", SearchOption.AllDirectories))
-            {
-                size += fi.Length;
+            if ((File.GetAttributes(folderPath) & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint) {
+                Log("[SIZE WARNING] Skipped reparse-point source directory: " + folderPath);
+                return 0;
             }
-        } catch {}
+        } catch (Exception ex) { Log("[SIZE WARNING] " + folderPath + " : " + ex.Message); return 0; }
+        Stack<string> pending = new Stack<string>();
+        pending.Push(folderPath);
+        while (pending.Count > 0) {
+            string current = pending.Pop();
+            try {
+                foreach (string file in Directory.EnumerateFiles(current)) {
+                    try { size += new FileInfo(file).Length; }
+                    catch (Exception ex) { Log("[SIZE WARNING] " + file + " : " + ex.Message); }
+                }
+                foreach (string dir in Directory.EnumerateDirectories(current)) {
+                    try {
+                        if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != FileAttributes.ReparsePoint)
+                            pending.Push(dir);
+                        else Log("[SIZE WARNING] Skipped reparse-point directory: " + dir);
+                    } catch (Exception ex) { Log("[SIZE WARNING] " + dir + " : " + ex.Message); }
+                }
+            } catch (Exception ex) { Log("[SIZE WARNING] " + current + " : " + ex.Message); }
+        }
         return size;
     }
 
@@ -268,36 +329,58 @@ public class FastFileMover
         if (IsCancelled) return;
         try
         {
+            if ((File.GetAttributes(sourceDir) & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint) {
+                SkippedCount++; Log("[SKIPPED] Reparse-point source directory: " + sourceDir); return;
+            }
+            DateTime sourceCreationUtc = Directory.GetCreationTimeUtc(sourceDir);
+            DateTime sourceWriteUtc = Directory.GetLastWriteTimeUtc(sourceDir);
+            DateTime sourceAccessUtc = Directory.GetLastAccessTimeUtc(sourceDir);
             if (!Directory.Exists(destDir))
                 Directory.CreateDirectory(destDir);
                 
-            foreach (string file in Directory.GetFiles(sourceDir))
+            foreach (string file in Directory.EnumerateFiles(sourceDir))
             {
+                PauseEvent.WaitOne();
                 if (IsCancelled) break;
                 string destFile = Path.Combine(destDir, Path.GetFileName(file));
                 if (move) MoveFileFast(file, destFile);
                 else CopyFileFast(file, destFile);
             }
             
-            foreach (string dir in Directory.GetDirectories(sourceDir))
+            foreach (string dir in Directory.EnumerateDirectories(sourceDir))
             {
+                PauseEvent.WaitOne();
                 if (IsCancelled) break;
+                if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint) {
+                    Log("[SKIPPED] Reparse-point directory: " + dir);
+                    SkippedCount++;
+                    continue;
+                }
                 string destSubDir = Path.Combine(destDir, Path.GetFileName(dir));
                 ProcessDirectory(dir, destSubDir, move);
             }
             
             if (move && !IsCancelled)
             {
-                try { Directory.Delete(sourceDir, false); } catch {}
+                try { Directory.Delete(sourceDir, false); }
+                catch (Exception ex) { FailedCount++; Log("[DIRECTORY RETAINED] " + sourceDir + " : " + ex.Message); }
+            }
+            if (!IsCancelled && Directory.Exists(destDir)) {
+                try {
+                    Directory.SetCreationTimeUtc(destDir, sourceCreationUtc);
+                    Directory.SetLastWriteTimeUtc(destDir, sourceWriteUtc);
+                    Directory.SetLastAccessTimeUtc(destDir, sourceAccessUtc);
+                } catch (Exception ex) { Log("[METADATA WARNING] " + sourceDir + " : " + ex.Message); }
             }
         }
-        catch {}
+        catch (Exception ex) { FailedCount++; Log("[DIRECTORY ERROR] " + sourceDir + " : " + ex.Message); }
     }
 
     public void ProcessItems(string[] sources, string destFolder, bool move)
     {
         foreach (var src in sources)
         {
+            PauseEvent.WaitOne();
             if (IsCancelled) break;
             string destItem = Path.Combine(destFolder, Path.GetFileName(src));
             if (File.Exists(src))
@@ -309,6 +392,7 @@ public class FastFileMover
             {
                 ProcessDirectory(src, destItem, move);
             }
+            else { FailedCount++; Log("[MISSING SOURCE] " + src); }
         }
     }
 
@@ -316,9 +400,11 @@ public class FastFileMover
     {
         if (sources == null || destinations == null) return;
 
+        if (sources.Length != destinations.Length) Log("[WARNING] Source and destination list lengths differ; unmatched items were ignored.");
         int itemCount = Math.Min(sources.Length, destinations.Length);
         for (int i = 0; i < itemCount; i++)
         {
+            PauseEvent.WaitOne();
             if (IsCancelled) break;
 
             string src = sources[i];
@@ -334,6 +420,7 @@ public class FastFileMover
             {
                 ProcessDirectory(src, dest, move);
             }
+            else { FailedCount++; Log("[MISSING SOURCE] " + src); }
         }
     }
 
@@ -353,6 +440,9 @@ public class FastFileMover
             ProcessedBytes = 0;
             TotalBytes = 0;
             IsCancelled = false;
+            SuccessCount = 0;
+            SkippedCount = 0;
+            FailedCount = 0;
             DefaultOverwriteAction = -1;
             lastTick = 0;
             TransferLog = new List<string>();
@@ -362,12 +452,18 @@ public class FastFileMover
                 long total = GetTotalSize(sources);
                 TotalBytes = total;
 
+                bool proceed = true;
+                if (UIDispatcher != null && UIPreflightAction != null)
+                    proceed = Convert.ToBoolean(UIDispatcher.Invoke(UIPreflightAction, new object[] { total }));
+                if (!proceed) { IsCancelled = true; Log("[CANCELLED] Preflight declined."); return; }
+
                 if (UIDispatcher != null && onPreProcess != null) {
                     UIDispatcher.Invoke(onPreProcess);
                 }
 
                 ProcessItems(sources, destFolder, move);
             }
+            catch (Exception ex) { FailedCount++; Log("[TRANSFER ERROR] " + ex.Message); }
             finally
             {
                 if (UIDispatcher != null && onComplete != null) {
@@ -383,6 +479,9 @@ public class FastFileMover
             ProcessedBytes = 0;
             TotalBytes = 0;
             IsCancelled = false;
+            SuccessCount = 0;
+            SkippedCount = 0;
+            FailedCount = 0;
             DefaultOverwriteAction = -1;
             lastTick = 0;
             TransferLog = new List<string>();
@@ -392,12 +491,18 @@ public class FastFileMover
                 long total = GetTotalSize(sources);
                 TotalBytes = total;
 
+                bool proceed = true;
+                if (UIDispatcher != null && UIPreflightAction != null)
+                    proceed = Convert.ToBoolean(UIDispatcher.Invoke(UIPreflightAction, new object[] { total }));
+                if (!proceed) { IsCancelled = true; Log("[CANCELLED] Preflight declined."); return; }
+
                 if (UIDispatcher != null && onPreProcess != null) {
                     UIDispatcher.Invoke(onPreProcess);
                 }
 
                 ProcessItems(sources, destinations, move);
             }
+            catch (Exception ex) { FailedCount++; Log("[TRANSFER ERROR] " + ex.Message); }
             finally
             {
                 if (UIDispatcher != null && onComplete != null) {
@@ -489,6 +594,10 @@ if (-not ('FileItem' -as [type]) -or -not ('FastFileMover' -as [type])) {
             <Setter Property="CanUserAddRows" Value="False"/>
             <Setter Property="AutoGenerateColumns" Value="False"/>
             <Setter Property="IsReadOnly" Value="True"/>
+            <Setter Property="EnableRowVirtualization" Value="True"/>
+            <Setter Property="EnableColumnVirtualization" Value="True"/>
+            <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling"/>
+            <Setter Property="ScrollViewer.IsDeferredScrollingEnabled" Value="True"/>
         </Style>
         <Style TargetType="DataGridColumnHeader">
             <Setter Property="Background" Value="#F8FAFC"/>
@@ -970,6 +1079,8 @@ $script:TransferStopwatch = $null
 $script:SourceAllItems = $null
 $script:TransferredFileSet = $null
 $script:StagedItems = New-Object System.Collections.ObjectModel.ObservableCollection[FileItem]
+$script:SourceLoadGeneration = 0
+$script:DestLoadGeneration = 0
 $StagingList.ItemsSource = $script:StagedItems
 
 function Format-Size {
@@ -1208,8 +1319,8 @@ function Update-TransferSummary {
         }
     }
 
-    $verb = if ($fileCount -eq 1) { 'file copied' } else { 'files copied' }
-    $TransferStatsText.Text = "{0} {1} ({2} total transferred) | Speed: {3} | Overall Progress [{4}%] | Est. Time: {5}" -f $fileCount, $verb, (Format-Size $Processed), $speedStr, $percent, $eta
+    $verb = if ($fileCount -eq 1) { 'file processed' } else { 'files processed' }
+    $TransferStatsText.Text = "{0} {1} ({2} streamed) | Speed: {3} | Overall Progress [{4}%] | Est. Time: {5}" -f $fileCount, $verb, (Format-Size $Processed), $speedStr, $percent, $eta
 }
 
 function Update-DestinationSummary {
@@ -1381,6 +1492,40 @@ function Apply-SourceFilter {
     }
 }
 
+function Complete-DirectoryLoad {
+    param($Grid, [string]$Path, [int]$Generation, [string]$SelectedPath, $LoadedItems, [string]$LoadError)
+
+    if ($Grid -eq $SourceGrid) {
+        if ($Generation -ne $script:SourceLoadGeneration -or $Path -ne $script:SourceCurrentPath) { return }
+    } else {
+        if ($Generation -ne $script:DestLoadGeneration -or $Path -ne $script:DestCurrentPath) { return }
+    }
+    $items = New-Object System.Collections.ObjectModel.ObservableCollection[FileItem]
+    foreach ($f in $LoadedItems) {
+        $isFolder = $f.Type -eq 'Folder'
+        $ext = if ($isFolder) { '' } else { [System.IO.Path]::GetExtension($f.Name) }
+        $iconInfo = Get-FileIconInfo -IsContainer $isFolder -Ext $ext
+        $f.Icon = $iconInfo.Icon
+        $f.IconColor = $iconInfo.Color
+        $items.Add($f)
+    }
+    if ($LoadError) { $StatusText.Text = "Some entries in '$Path' could not be loaded. $LoadError" }
+    if ($Grid -eq $SourceGrid) {
+        $script:SourceAllItems = $items
+        Apply-SourceFilter
+    } else {
+        $Grid.ItemsSource = $items
+    }
+    if ($SelectedPath) {
+        $restoredItem = $items | Where-Object { $_.FullPath -eq $SelectedPath } | Select-Object -First 1
+        if ($restoredItem) {
+            $Grid.SelectedItem = $restoredItem
+            $Grid.ScrollIntoView($restoredItem)
+        }
+    }
+    if ($Grid -eq $DestGrid) { Update-DestinationSummary }
+}
+
 function Load-Files {
     param([string]$Path, $Grid)
     $normalizedPath = Normalize-DirectoryPath $Path
@@ -1390,61 +1535,26 @@ function Load-Files {
     if ($Grid.SelectedItem -and $Grid.SelectedItem.PSObject.Properties['FullPath']) {
         $selectedPath = $Grid.SelectedItem.FullPath
     }
-
-    $items = New-Object System.Collections.ObjectModel.ObservableCollection[FileItem]
-    
-    try {
-        $entries = Get-ChildItem -LiteralPath $normalizedPath -Force -ErrorAction Stop | Sort-Object @{ Expression = { -not $_.PSIsContainer } }, Name
-        if (-not $script:ShowHiddenFiles) {
-            $entries = @($entries | Where-Object { -not ($_.Attributes -match 'Hidden') })
-        }
-        foreach ($entry in $entries) {
-            $f = New-Object FileItem
-            $f.Name = $entry.Name
-            $f.FullPath = $entry.FullName
-
-            if ($entry.PSIsContainer) {
-                $f.Type = 'Folder'
-                $f.Size = 0
-                $f.SizeStr = ''
-                $iconInfo = Get-FileIconInfo -IsContainer $true -Ext ""
-            } else {
-                $extension = [System.IO.Path]::GetExtension($entry.Name)
-                $f.Type = if ([string]::IsNullOrWhiteSpace($extension)) { 'File' } else { $extension }
-                $f.Size = $entry.Length
-                $f.SizeStr = Format-Size $f.Size
-                $iconInfo = Get-FileIconInfo -IsContainer $false -Ext $extension
-            }
-
-            $f.Icon = $iconInfo.Icon
-            $f.IconColor = $iconInfo.Color
-            $f.CreationTime = $entry.CreationTime.ToString("yyyy-MM-dd HH:mm")
-            $items.Add($f)
-        }
-    } catch {
-        $StatusText.Text = "Unable to load '$normalizedPath'. $($_.Exception.Message)"
-    }
-    
     if ($Grid -eq $SourceGrid) {
-        $script:SourceAllItems = $items
-        Apply-SourceFilter
+        $script:SourceLoadGeneration++
+        $generation = $script:SourceLoadGeneration
+        $script:SourceAllItems = $null
     } else {
-        $Grid.ItemsSource = $items
+        $script:DestLoadGeneration++
+        $generation = $script:DestLoadGeneration
     }
-
-    if ($selectedPath) {
-        $restoredItem = $items | Where-Object { $_.FullPath -eq $selectedPath } | Select-Object -First 1
-        if ($restoredItem) {
-            $Grid.SelectedItem = $restoredItem
-            $Grid.ScrollIntoView($restoredItem)
-        }
+    $Grid.ItemsSource = $null
+    $showHidden = [bool]$script:ShowHiddenFiles
+    $gridRef = $Grid
+    $pathRef = $normalizedPath
+    $generationRef = $generation
+    $selectedPathRef = $selectedPath
+    $callbackScript = {
+        param($loadedItems, $loadError)
+        Complete-DirectoryLoad -Grid $gridRef -Path $pathRef -Generation $generationRef -SelectedPath $selectedPathRef -LoadedItems $loadedItems -LoadError $loadError
     }
-
-    # Deselect checkbox if SelectAll exists in template logic (handled via XAML normally)
-
-    if ($Grid -eq $DestGrid) {
-        Update-DestinationSummary
-    }
+    $callback = [System.Action[System.Collections.Generic.List[FileItem], string]]($callbackScript.GetNewClosure())
+    [DirectoryLoader]::LoadAsync($normalizedPath, $showHidden, $Window.Dispatcher, $callback)
 }
 
 function Update-SourcePane {
@@ -1818,6 +1928,19 @@ function Start-Transfer([string]$DestPath, [bool]$Move) {
     }
     
     $sourcePaths = [string[]]@($script:StagedItems | Select-Object -ExpandProperty FullPath)
+
+    foreach ($source in $sourcePaths) {
+        $targetPath = [System.IO.Path]::GetFullPath((Join-Path $DestPath ([System.IO.Path]::GetFileName($source))))
+        $targetPath = $targetPath.TrimEnd([char[]]@('\','/'))
+        $sourceFullPath = [System.IO.Path]::GetFullPath($source).TrimEnd([char[]]@('\','/'))
+        if ($targetPath.Equals($sourceFullPath, [StringComparison]::OrdinalIgnoreCase) -or
+            ([System.IO.Directory]::Exists($source) -and (
+                $targetPath.StartsWith($sourceFullPath + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+                $targetPath.StartsWith($sourceFullPath + [System.IO.Path]::AltDirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)))) {
+                [System.Windows.MessageBox]::Show("The destination cannot be the same as, or inside, a staged source folder.", "Invalid Destination")
+                return
+        }
+    }
     
     $ControlsToDisable = @($SourceDriveCombo, $DestDriveCombo, $BtnStageSelected, $BtnRemoveStaged, $CtxRemoveStaged, $BtnClearStage, $BtnCopyStaged, $BtnMoveStaged, $SourceGrid, $DestGrid, $StagingList, $SourceUpButton, $DestUpButton, $SourceRefreshButton, $DestRefreshButton, $DestNewFolderButton, $DestDeleteButton, $CtxDeleteDestSelected)
     Set-ControlEnabled -Controls $ControlsToDisable -Enabled $false
@@ -1830,6 +1953,24 @@ function Start-Transfer([string]$DestPath, [bool]$Move) {
     $mover = New-Object FastFileMover
     $script:ActiveMover = $mover
     $mover.UIDispatcher = $Window.Dispatcher
+    $mover.UIPreflightAction = [System.Func[long, bool]]{
+        param($estimatedBytes)
+        $drive = Get-DriveInfoForPath $DestPath
+        $available = if ($drive) { [long]$drive.AvailableFreeSpace } else { -1L }
+        $conflictCount = 0
+        foreach ($source in $sourcePaths) {
+            $topLevelTarget = Join-Path $DestPath ([System.IO.Path]::GetFileName($source))
+            if ([System.IO.File]::Exists($topLevelTarget) -or [System.IO.Directory]::Exists($topLevelTarget)) { $conflictCount++ }
+        }
+        $message = "Items: $($sourcePaths.Count)`nEstimated data: $(Format-Size $estimatedBytes)`nTop-level name conflicts: $conflictCount`nAvailable destination space: $(if ($available -ge 0) { Format-Size $available } else { 'Unavailable' })"
+        if ($available -ge 0 -and $estimatedBytes -gt $available) {
+            $message += "`n`nThe estimate exceeds available space. A move on the same volume may need less; continue anyway?"
+        } else {
+            $message += "`n`nNested folder conflicts may also be prompted during transfer. Continue?"
+        }
+        $answer = [System.Windows.MessageBox]::Show($message, "Transfer Preflight", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+        return ($answer -eq [System.Windows.MessageBoxResult]::Yes)
+    }
     Update-TransferState
     $mover.UIProgressAction = [System.Action[long, long, string]]{
         param($processed, $total, $file)
@@ -1886,16 +2027,16 @@ function Start-Transfer([string]$DestPath, [bool]$Move) {
 "@
         $reader = (New-Object System.Xml.XmlNodeReader ([xml]$xaml))
         $promptWindow = [Windows.Markup.XamlReader]::Load($reader)
-        $res = 3
-        $promptWindow.FindName('BtnYes').Add_Click({ $res = 1; $promptWindow.Close() })
-        $promptWindow.FindName('BtnYesAll').Add_Click({ $res = 2; $promptWindow.Close() })
-        $promptWindow.FindName('BtnSkip').Add_Click({ $res = 0; $promptWindow.Close() })
-        $promptWindow.FindName('BtnSkipAll').Add_Click({ $res = 4; $promptWindow.Close() })
-        $promptWindow.FindName('BtnKeep').Add_Click({ $res = 5; $promptWindow.Close() })
-        $promptWindow.FindName('BtnKeepAll').Add_Click({ $res = 6; $promptWindow.Close() })
-        $promptWindow.FindName('BtnCancel').Add_Click({ $res = 3; $promptWindow.Close() })
+        $promptWindow.Tag = 3
+        $promptWindow.FindName('BtnYes').Add_Click({ $promptWindow.Tag = 1; $promptWindow.Close() })
+        $promptWindow.FindName('BtnYesAll').Add_Click({ $promptWindow.Tag = 2; $promptWindow.Close() })
+        $promptWindow.FindName('BtnSkip').Add_Click({ $promptWindow.Tag = 0; $promptWindow.Close() })
+        $promptWindow.FindName('BtnSkipAll').Add_Click({ $promptWindow.Tag = 4; $promptWindow.Close() })
+        $promptWindow.FindName('BtnKeep').Add_Click({ $promptWindow.Tag = 5; $promptWindow.Close() })
+        $promptWindow.FindName('BtnKeepAll').Add_Click({ $promptWindow.Tag = 6; $promptWindow.Close() })
+        $promptWindow.FindName('BtnCancel').Add_Click({ $promptWindow.Tag = 3; $promptWindow.Close() })
         $promptWindow.ShowDialog() | Out-Null
-        return $res
+        return [int]$promptWindow.Tag
     }
 
     $mover.UIOverwritePrompt = [System.Func[string, int]]{
@@ -1912,17 +2053,24 @@ function Start-Transfer([string]$DestPath, [bool]$Move) {
     }
 
     $onComplete = [System.Action]{
-        if ($Move -and -not $mover.IsCancelled) {
-            $script:StagedItems.Clear()
+        if ($Move) {
+            foreach ($staged in @($script:StagedItems)) {
+                if (-not [System.IO.File]::Exists($staged.FullPath) -and -not [System.IO.Directory]::Exists($staged.FullPath)) {
+                    [void]$script:StagedItems.Remove($staged)
+                }
+            }
             Calculate-Staged-Size
         }
         Update-SourcePane
         Update-DestPane
         
-        $statusMsg = if ($mover.IsCancelled) { "Cancelled. Ready for next transfer." } else { "Completed. Ready for next transfer." }
+        $statusMsg = if ($mover.IsCancelled) { "Cancelled" } elseif ($mover.FailedCount -gt 0 -or $mover.SkippedCount -gt 0) { "Finished with issues" } else { "Transfer finished" }
+        $statusMsg += ": $($mover.SuccessCount) succeeded, $($mover.SkippedCount) skipped, $($mover.FailedCount) failed."
+        $warningCount = @($mover.TransferLog | Where-Object { $_ -match '\[(SIZE WARNING|METADATA WARNING|WARNING)\]' }).Count
+        if ($warningCount -gt 0) { $statusMsg += " $warningCount warning(s); see transfer log." }
         
         if ($mover.TransferLog.Count -gt 0) {
-            $logFileName = "TransferLog_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+            $logFileName = "TransferLog_$(Get-Date -Format 'yyyyMMdd_HHmmss_fff')_$([guid]::NewGuid().ToString('N').Substring(0, 8)).txt"
             $logPath = Join-Path $DestPath $logFileName
             try {
                 [System.IO.File]::WriteAllLines($logPath, $mover.TransferLog.ToArray())
@@ -2001,9 +2149,28 @@ if ($script:DestCurrentPath) {
 Update-StagedActionState
 Reset-TransferUi -StatusMessage "Ready"
 
+$Window.Add_Closing({
+    param($sender, $e)
+    if ($script:IsTransferInProgress) {
+        $e.Cancel = $true
+        $confirmation = [System.Windows.MessageBox]::Show(
+            "A transfer is still running. Cancel it and wait for it to finish before closing?",
+            "Transfer in Progress",
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Warning
+        )
+        if ($confirmation -eq [System.Windows.MessageBoxResult]::Yes -and $script:ActiveMover) {
+            $script:ActiveMover.IsCancelled = $true
+            $script:ActiveMover.PauseEvent.Set() | Out-Null
+            $StatusText.Text = "Cancelling transfer before close..."
+        }
+    }
+})
+
 $Window.Add_Closed({
     # Cleanup event hook when window closes
     Unregister-Event -SourceIdentifier "EventArrived" -ErrorAction SilentlyContinue
+    if ($eventJob) { Remove-Job -Job $eventJob -Force -ErrorAction SilentlyContinue }
     $watcher.Stop()
     $watcher.Dispose()
 })

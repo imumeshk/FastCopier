@@ -10,14 +10,19 @@ Fast File Copier and Mover is a graphical user interface (GUI) tool built with P
 - **Live Progress & Stats**: Displays real-time transfer speed, overall progress, estimated time of arrival (ETA), and current file status.
 - **Pause & Resume**: Easily pause and resume large transfers.
 - **Conflict Resolution**: Prompt for actions when a file already exists at the destination (Overwrite, Skip, Keep Both).
+- **Safer Replacement**: Writes new file contents to a temporary file and replaces the destination only after the copy completes.
+- **Transfer Results**: Reports succeeded, skipped, and failed items, and retains staged move items that still exist at the source.
+- **Transfer Preflight**: Shows estimated data size, available destination space, and top-level name conflicts before transfer begins.
+- **Responsive Browsing**: Loads directory listings in the background and virtualizes grid rows for large folders.
+- **Metadata Preservation**: Best-effort preservation of file timestamps and attributes, plus directory timestamps.
 - **Transfer Logs**: Automatically generates a transfer log file in the destination folder after a successful or cancelled operation.
 - **Filtering**: Quickly filter source files by name.
 
 ## Prerequisites
 
 - **OS**: Windows 10 or Windows 11
-- **PowerShell**: Windows PowerShell 5.1 (or PowerShell 7+)
-- **.NET Framework**: Requires components that are standard in modern Windows installations (PresentationFramework, System.Windows.Forms).
+- **PowerShell**: Windows PowerShell 5.1
+- **.NET Framework**: Uses Windows WPF and Windows Forms components available on supported Windows installations. PowerShell 7 compatibility is not currently verified.
 
 ## How to Run
 
@@ -78,6 +83,16 @@ The tool copies data using 8MB chunks, which is highly efficient. However, trans
 The script uses WMI to detect new drives automatically. If a drive does not show up:
 **Fix**: Click the **Refresh** icon next to the source or destination path dropdowns to force a manual refresh of the drive list.
 
-### Application Freezes during massive transfers
-The underlying C# file mover operates on a background thread to keep the UI responsive, but populating massive folders (e.g., 100,000+ files) into the visual grid can momentarily strain the UI.
-**Fix**: Allow the application a moment to process large directory enumerations. Wait for the "Calculating size..." status to finish before clicking other buttons.
+### Browsing very large folders
+Directory listings load in the background and the grids virtualize rows. Very large directories can still take time to enumerate and sort, especially on network shares.
+
+### Destination conflicts or failed transfers
+The overwrite prompt offers one-time and all-item choices. A cancelled copy removes its temporary output, and an existing destination file is preserved until its replacement is ready. Check the transfer status and generated transfer log for item-level outcomes. Items that remain at their source stay in the staging queue after a move.
+
+Do not select a destination that is the same as or nested under a staged source folder. The application checks this before starting to prevent recursive copying.
+
+## Limitations
+- File timestamps and attributes are preserved on a best-effort basis. Alternate data streams, security descriptors, and hard links are not preserved.
+- Preflight size and free-space values are estimates; available space can change before or during transfer. The preflight lists top-level conflicts, while nested conflicts are handled during the transfer.
+- Size estimates may be incomplete when Windows denies access to part of a source tree. Check the transfer log for size warnings and per-item results.
+- Reparse-point directories are skipped during recursive transfers to avoid traversing directory junction loops.
