@@ -59,61 +59,6 @@ public class FileItem : INotifyPropertyChanged
     }
 }
 
-public static class DirectoryLoader
-{
-    public static void LoadAsync(string path, bool showHidden, Dispatcher dispatcher, Action<List<FileItem>, string> callback)
-    {
-        ThreadPool.QueueUserWorkItem(_ =>
-        {
-            List<FileItem> items = new List<FileItem>();
-            string error = null;
-            try
-            {
-                foreach (string entryPath in Directory.EnumerateFileSystemEntries(path))
-                {
-                    try
-                    {
-                        FileAttributes attributes = File.GetAttributes(entryPath);
-                        if (!showHidden && (attributes & FileAttributes.Hidden) == FileAttributes.Hidden) continue;
-                        bool isDirectory = (attributes & FileAttributes.Directory) == FileAttributes.Directory;
-                        FileInfo fi = isDirectory ? null : new FileInfo(entryPath);
-                        string ext = isDirectory ? "" : Path.GetExtension(entryPath);
-                        items.Add(new FileItem {
-                            Name = Path.GetFileName(entryPath), FullPath = entryPath,
-                            Type = isDirectory ? "Folder" : (String.IsNullOrWhiteSpace(ext) ? "File" : ext),
-                            Size = isDirectory ? 0 : fi.Length,
-                            SizeStr = isDirectory ? "" : FormatSize(fi.Length),
-                            CreationTime = (isDirectory ? Directory.GetCreationTime(entryPath) : fi.CreationTime).ToString("yyyy-MM-dd HH:mm"),
-                            Icon = isDirectory ? Char.ConvertFromUtf32(0xE8B7) : Char.ConvertFromUtf32(0xE7C3),
-                            IconColor = isDirectory ? "#F59E0B" : "#64748B",
-                            Status = "Ready"
-                        });
-                    }
-                    catch (Exception ex) { error = "Some entries could not be read: " + ex.Message; }
-                }
-                items.Sort((a, b) => {
-                    bool ad = a.Type == "Folder", bd = b.Type == "Folder";
-                    if (ad != bd) return ad ? -1 : 1;
-                    return String.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase);
-                });
-            }
-            catch (Exception ex) { error = ex.Message; }
-            if (dispatcher != null && callback != null) {
-                try { dispatcher.BeginInvoke(new Action(() => callback(items, error))); }
-                catch { /* The window may close while a directory listing is finishing. */ }
-            }
-        });
-    }
-
-    private static string FormatSize(long bytes)
-    {
-        if (bytes >= 1024L * 1024L * 1024L) return String.Format("{0:N2} GB", (double)bytes / (1024L * 1024L * 1024L));
-        if (bytes >= 1024L * 1024L) return String.Format("{0:N2} MB", (double)bytes / (1024L * 1024L));
-        if (bytes >= 1024L) return String.Format("{0:N2} KB", (double)bytes / 1024L);
-        return bytes + " B";
-    }
-}
-
 public class FastFileMover
 {
     private const int BufferSize = 8 * 1024 * 1024;
@@ -516,6 +461,81 @@ public class FastFileMover
 
 if (-not ('FileItem' -as [type]) -or -not ('FastFileMover' -as [type])) {
     Add-Type -TypeDefinition $CSharpCode -Language CSharp -ReferencedAssemblies "System", "System.Core", "WindowsBase" -ErrorAction Stop
+}
+
+$DirectoryLoaderCode = @"
+using System;
+using System.IO;
+using System.Threading;
+using System.Windows.Threading;
+using System.Collections.Generic;
+
+public class DirectoryEntry
+{
+    public string Name { get; set; }
+    public string FullPath { get; set; }
+    public string Type { get; set; }
+    public long Size { get; set; }
+    public string SizeStr { get; set; }
+    public string CreationTime { get; set; }
+}
+
+public static class FastCopierDirectoryLoaderV110
+{
+    public static void LoadAsync(string path, bool showHidden, Dispatcher dispatcher, Action<List<DirectoryEntry>, string> callback)
+    {
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            List<DirectoryEntry> items = new List<DirectoryEntry>();
+            List<string> errors = new List<string>();
+            try
+            {
+                foreach (string entryPath in Directory.EnumerateFileSystemEntries(path))
+                {
+                    try
+                    {
+                        FileAttributes attributes = File.GetAttributes(entryPath);
+                        if (!showHidden && (attributes & FileAttributes.Hidden) == FileAttributes.Hidden) continue;
+                        bool isDirectory = (attributes & FileAttributes.Directory) == FileAttributes.Directory;
+                        FileInfo fi = isDirectory ? null : new FileInfo(entryPath);
+                        string ext = isDirectory ? "" : Path.GetExtension(entryPath);
+                        long size = isDirectory ? 0 : fi.Length;
+                        items.Add(new DirectoryEntry {
+                            Name = Path.GetFileName(entryPath), FullPath = entryPath,
+                            Type = isDirectory ? "Folder" : (String.IsNullOrWhiteSpace(ext) ? "File" : ext),
+                            Size = size, SizeStr = isDirectory ? "" : FormatSize(size),
+                            CreationTime = (isDirectory ? Directory.GetCreationTime(entryPath) : fi.CreationTime).ToString("yyyy-MM-dd HH:mm")
+                        });
+                    }
+                    catch (Exception ex) { errors.Add(entryPath + " : " + ex.Message); }
+                }
+                items.Sort((a, b) => {
+                    bool ad = a.Type == "Folder", bd = b.Type == "Folder";
+                    if (ad != bd) return ad ? -1 : 1;
+                    return String.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase);
+                });
+            }
+            catch (Exception ex) { errors.Add(ex.Message); }
+            string error = errors.Count == 0 ? null : errors.Count + " item(s) could not be read. First error: " + errors[0];
+            if (dispatcher != null && callback != null) {
+                try { dispatcher.BeginInvoke(new Action(() => callback(items, error))); }
+                catch { /* The window may close while a directory listing is finishing. */ }
+            }
+        });
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        if (bytes >= 1024L * 1024L * 1024L) return String.Format("{0:N2} GB", (double)bytes / (1024L * 1024L * 1024L));
+        if (bytes >= 1024L * 1024L) return String.Format("{0:N2} MB", (double)bytes / (1024L * 1024L));
+        if (bytes >= 1024L) return String.Format("{0:N2} KB", (double)bytes / 1024L);
+        return bytes + " B";
+    }
+}
+"@
+
+if (-not ('FastCopierDirectoryLoaderV110' -as [type])) {
+    Add-Type -TypeDefinition $DirectoryLoaderCode -Language CSharp -ReferencedAssemblies "System", "System.Core", "WindowsBase" -ErrorAction Stop
 }
 
 # --- UI Definition ---
@@ -1501,7 +1521,15 @@ function Complete-DirectoryLoad {
         if ($Generation -ne $script:DestLoadGeneration -or $Path -ne $script:DestCurrentPath) { return }
     }
     $items = New-Object System.Collections.ObjectModel.ObservableCollection[FileItem]
-    foreach ($f in $LoadedItems) {
+    foreach ($entry in $LoadedItems) {
+        $f = New-Object FileItem
+        $f.Name = $entry.Name
+        $f.FullPath = $entry.FullPath
+        $f.Type = $entry.Type
+        $f.Size = $entry.Size
+        $f.SizeStr = $entry.SizeStr
+        $f.CreationTime = $entry.CreationTime
+        $f.Status = 'Ready'
         $isFolder = $f.Type -eq 'Folder'
         $ext = if ($isFolder) { '' } else { [System.IO.Path]::GetExtension($f.Name) }
         $iconInfo = Get-FileIconInfo -IsContainer $isFolder -Ext $ext
@@ -1553,8 +1581,8 @@ function Load-Files {
         param($loadedItems, $loadError)
         Complete-DirectoryLoad -Grid $gridRef -Path $pathRef -Generation $generationRef -SelectedPath $selectedPathRef -LoadedItems $loadedItems -LoadError $loadError
     }
-    $callback = [System.Action[System.Collections.Generic.List[FileItem], string]]($callbackScript.GetNewClosure())
-    [DirectoryLoader]::LoadAsync($normalizedPath, $showHidden, $Window.Dispatcher, $callback)
+    $callback = [System.Action[System.Collections.Generic.List[DirectoryEntry], string]]($callbackScript.GetNewClosure())
+    [FastCopierDirectoryLoaderV110]::LoadAsync($normalizedPath, $showHidden, $Window.Dispatcher, $callback)
 }
 
 function Update-SourcePane {
