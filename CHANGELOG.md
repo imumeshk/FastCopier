@@ -23,6 +23,7 @@
 - Transfer log filenames include a unique suffix to avoid replacing an earlier run's log.
 
 ### Fixed
+- The background directory loader now compiles independently of the transfer helper types, so it is available when the script is run in a PowerShell session that already has older helper types loaded.
 - Cross-volume moves no longer delete the source after an unsuccessful copy.
 - Cancelled or failed copies remove incomplete temporary output.
 - Size calculation warnings and directory-processing errors are recorded in the transfer log.
